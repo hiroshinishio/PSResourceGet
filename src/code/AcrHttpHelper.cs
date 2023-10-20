@@ -1,22 +1,15 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-using Microsoft.PowerShell.PowerShellGet.UtilClasses;
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Management.Automation;
+using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.Text;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Collections.ObjectModel;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-
-
-using Dbg = System.Diagnostics.Debug;
 
 namespace Microsoft.PowerShell.PowerShellGet.Cmdlets
 {
@@ -29,7 +22,9 @@ namespace Microsoft.PowerShell.PowerShellGet.Cmdlets
         const string acrManifestUrlTemplate = "https://{0}/v2/{1}/manifests/{2}"; // 0 - registry, 1 - repo(modulename), 2 - tag(version)
         const string acrBlobDownloadUrlTemplate = "https://{0}/v2/{1}/blobs/{2}"; // 0 - registry, 1 - repo(modulename), 2 - layer digest
         const string acrFindImageVersionUrlTemplate = "https://{0}/acr/v1/{1}/_tags{2}"; // 0 - registry, 1 - repo(modulename), 2 - /tag(version)
-
+        const string acrStartUploadTemplate = "https://{0}/v2/{1}/blobs/uploads/"; // 0 - registry, 1 - packagename
+        const string acrEndUploadTemplate = "https://{0}{1}&digest=sha256:{2}"; // 0 - registry, 1 - location, 2 - digest
+        
         private static readonly HttpClient s_client = new HttpClient();
 
         internal static async Task<string> GetAcrRefreshTokenAsync(string registry, string tenant, string accessToken)
@@ -74,6 +69,48 @@ namespace Microsoft.PowerShell.PowerShellGet.Cmdlets
             catch (HttpRequestException e)
             {
                 throw new HttpRequestException("Error finding ACR artifact: " + e.Message);
+            }
+        }
+
+        internal static async Task<string> GetStartUploadBlobLocation(string registry, string pkgName, string acrAccessToken)
+        {
+            try
+            {
+                var defaultHeaders = GetDefaultHeaders(acrAccessToken);
+                var startUploadUrl = string.Format(acrStartUploadTemplate, registry, pkgName);
+                return (await GetHttpResponseHeader(startUploadUrl, HttpMethod.Post, defaultHeaders)).Location.ToString();
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error starting publishing to ACR: " + e.Message);
+            }
+        }
+
+        internal static async Task<bool> EndUploadBlob(string registry, string location, string filePath, string digest, bool isManifest, string acrAccessToken)
+        {
+            try
+            {
+                var endUploadUrl = string.Format(acrEndUploadTemplate, registry, location, digest);
+                var defaultHeaders = GetDefaultHeaders(acrAccessToken);
+                return await PutRequestAsync(endUploadUrl, filePath, isManifest, defaultHeaders);
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error occured while trying to uploading module to ACR: " + e.Message);
+            }
+        }
+
+        internal static async Task<bool> CreateManifest(string registry, string pkgName, string pkgVersion, string configPath, bool isManifest, string acrAccessToken)
+        {
+            try
+            {
+                var createManifestUrl = string.Format(acrManifestUrlTemplate, registry, pkgName, pkgVersion);
+                var defaultHeaders = GetDefaultHeaders(acrAccessToken);
+                return await PutRequestAsync(createManifestUrl, configPath, isManifest, defaultHeaders);
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error occured while trying to create manifest: " + e.Message);
             }
         }
 
@@ -134,6 +171,20 @@ namespace Microsoft.PowerShell.PowerShellGet.Cmdlets
             }
         }
 
+        internal static async Task<HttpResponseHeaders> GetHttpResponseHeader (string url, HttpMethod method, Collection<KeyValuePair<string, string>> defaultHeaders)
+        {
+            try
+            {
+                HttpRequestMessage request = new HttpRequestMessage(method, url);
+                SetDefaultHeaders(defaultHeaders);
+                return await SendRequestHeaderAsync(request);
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error occured while trying to retrieve response header: " + e.Message);
+            }
+        }
+
         private static void SetDefaultHeaders(Collection<KeyValuePair<string, string>> defaultHeaders)
         {
             s_client.DefaultRequestHeaders.Clear();
@@ -183,6 +234,50 @@ namespace Microsoft.PowerShell.PowerShellGet.Cmdlets
             {
                 throw new HttpRequestException("Error occured while trying to retrieve response: " + e.Message);
             }
+        }
+
+        private static async Task<HttpResponseHeaders> SendRequestHeaderAsync(HttpRequestMessage message)
+        {
+            try
+            {
+                HttpResponseMessage response = await s_client.SendAsync(message);
+                response.EnsureSuccessStatusCode();
+                return response.Headers;
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error occured while trying to retrieve response: " + e.Message);
+            }
+        }
+
+        private static async Task<bool> PutRequestAsync(string url, string filePath, bool isManifest, Collection<KeyValuePair<string, string>> contentHeaders)
+        {
+            try
+            {
+                SetDefaultHeaders(contentHeaders);
+
+                FileInfo fileInfo = new FileInfo(filePath);
+                FileStream fileStream = fileInfo.Open(FileMode.Open, FileAccess.Read);
+                HttpContent httpContent = new StreamContent(fileStream);
+                if (isManifest)
+                {
+                    httpContent.Headers.Add("Content-Type", "application/vnd.oci.image.manifest.v1+json");
+                }
+                else
+                {
+                    httpContent.Headers.Add("Content-Type", "application/octet-stream");
+                }
+                
+                HttpResponseMessage response = await s_client.PutAsync(url, httpContent);
+                response.EnsureSuccessStatusCode();
+                fileStream.Close();
+                return response.IsSuccessStatusCode;
+            }
+            catch (HttpRequestException e)
+            {
+                throw new HttpRequestException("Error occured while trying to uploading module to ACR: " + e.Message);
+            }
+            
         }
 
         private static Collection<KeyValuePair<string, string>> GetDefaultHeaders(string acrAccessToken)
